@@ -4,6 +4,7 @@ import asyncio
 import httpx
 
 from telegram import Update
+from telegram.request import HTTPXRequest
 from telegram.error import Forbidden, RetryAfter
 from telegram.ext import (
     Application,
@@ -296,7 +297,19 @@ def main():
     if not all(required) or ADMIN_ID == 0:
         raise RuntimeError("Missing required environment variables.")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    telegram_request = HTTPXRequest(
+    connect_timeout=60,
+    read_timeout=60,
+    write_timeout=60,
+    pool_timeout=60,
+)
+
+app = (
+    Application.builder()
+    .token(BOT_TOKEN)
+    .request(telegram_request)
+    .build()
+)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
