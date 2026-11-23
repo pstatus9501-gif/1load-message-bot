@@ -282,7 +282,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/stats - User statistics"
         )
     else:
-        await update.message.reply_text("Send LOAD to receive the latest update.")
+        await update.message.reply_text(
+            "Send LOAD to receive the latest update."
+        )
 
 
 def main():
@@ -297,7 +299,7 @@ def main():
     if not all(required) or ADMIN_ID == 0:
         raise RuntimeError("Missing required environment variables.")
 
-        telegram_request = HTTPXRequest(
+    telegram_request = HTTPXRequest(
         connect_timeout=60,
         read_timeout=60,
         write_timeout=60,
@@ -333,3 +335,7 @@ def main():
         webhook_url=f"{RENDER_EXTERNAL_URL.rstrip('/')}/{WEBHOOK_SECRET}",
         secret_token=WEBHOOK_SECRET,
     )
+
+
+if __name__ == "__main__":
+    main()
