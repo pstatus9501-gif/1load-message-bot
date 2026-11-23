@@ -31,11 +31,13 @@ def headers():
 
 
 async def db_request(method, table, **kwargs):
+    request_headers = kwargs.pop("headers", headers())
+
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.request(
             method,
             f"{SUPABASE_URL}/rest/v1/{table}",
-            headers=headers(),
+            headers=request_headers,
             **kwargs
         )
         response.raise_for_status()
