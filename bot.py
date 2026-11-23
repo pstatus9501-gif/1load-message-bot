@@ -297,19 +297,19 @@ def main():
     if not all(required) or ADMIN_ID == 0:
         raise RuntimeError("Missing required environment variables.")
 
-    telegram_request = HTTPXRequest(
-    connect_timeout=60,
-    read_timeout=60,
-    write_timeout=60,
-    pool_timeout=60,
-)
+        telegram_request = HTTPXRequest(
+        connect_timeout=60,
+        read_timeout=60,
+        write_timeout=60,
+        pool_timeout=60,
+    )
 
-app = (
-    Application.builder()
-    .token(BOT_TOKEN)
-    .request(telegram_request)
-    .build()
-)
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(telegram_request)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -333,7 +333,3 @@ app = (
         webhook_url=f"{RENDER_EXTERNAL_URL.rstrip('/')}/{WEBHOOK_SECRET}",
         secret_token=WEBHOOK_SECRET,
     )
-
-
-if __name__ == "__main__":
-    main()
