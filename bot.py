@@ -578,16 +578,20 @@ def main():
 
     # Same webhook method as the working Kaptaan bot
 
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_SECRET,
-        webhook_url=(
-            f"{RENDER_EXTERNAL_URL.rstrip('/')}/{WEBHOOK_SECRET}"
-        ),
-        secret_token=WEBHOOK_SECRET,
-        allowed_updates=Update.ALL_TYPES,
-    )
+    
+app.run_webhook(
+    listen="0.0.0.0",
+    port=PORT,
+    url_path=WEBHOOK_SECRET,
+    bootstrap_retries=5,
+    webhook_url=(
+        f"{RENDER_EXTERNAL_URL.rstrip('/')}/{WEBHOOK_SECRET}"
+    ),
+    secret_token=WEBHOOK_SECRET,
+    allowed_updates=Update.ALL_TYPES,
+)
+
+
 
 
 if __name__ == "__main__":
