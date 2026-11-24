@@ -1,12 +1,10 @@
+
 import os
-import json
 import asyncio
 import logging
 import httpx
-import tornado.web
 
 from telegram import Update
-from telegram.request import HTTPXRequest
 from telegram.error import Forbidden, RetryAfter
 from telegram.ext import (
     Application,
@@ -22,6 +20,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 PORT = int(os.getenv("PORT", "10000"))
@@ -31,7 +30,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# Hide HTTP request URLs containing the bot token
+# Hide Telegram API URLs containing the bot token
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -58,9 +57,12 @@ async def db_request(method, table, **kwargs):
             headers=request_headers,
             **kwargs
         )
+
         response.raise_for_status()
         return response
 
+
+# ================= USER DATABASE =================
 
 async def save_user(user):
     await db_request(
@@ -80,6 +82,40 @@ async def save_user(user):
     )
 
 
+async def get_users():
+    users = []
+    offset = 0
+    batch_size = 1000
+
+    while True:
+        response = await db_request(
+            "GET",
+            "bot_users",
+            params={
+                "select": "user_id",
+                "is_active": "eq.true",
+                "order": "user_id.asc",
+                "limit": batch_size,
+                "offset": offset,
+            }
+        )
+
+        data = response.json()
+
+        if not data:
+            break
+
+        users.extend(row["user_id"] for row in data)
+        offset += batch_size
+
+        if len(data) < batch_size:
+            break
+
+    return users
+
+
+# ================= LOAD MESSAGE DATABASE =================
+
 async def get_load():
     response = await db_request(
         "GET",
@@ -95,59 +131,29 @@ async def get_load():
     return data[0] if data else None
 
 
-# ================= USER COMMANDS =================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
-    try:
-        await save_user(user)
-    except Exception:
-        logger.exception("User registration failed")
-        await update.message.reply_text(
-            "Something went wrong. Please try again later."
-        )
-        return
-
-    await update.message.reply_text(
-        "Welcome! 👋\n\n"
-        "Send LOAD to receive the latest update."
+async def save_load(photo_id, message_text):
+    await db_request(
+        "POST",
+        "bot_messages",
+        params={"on_conflict": "message_key"},
+        headers={
+            **headers(),
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        },
+        json=[{
+            "message_key": "load",
+            "photo_file_id": photo_id,
+            "message_text": message_text,
+        }]
     )
 
 
-async def handle_load(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
-    try:
-        await save_user(user)
-        data = await get_load()
-
-        if not data:
-            await update.message.reply_text(
-                "Load message is currently unavailable. Please try later."
-            )
-            return
-
-        photo = data.get("photo_file_id")
-        caption = data.get("message_text") or ""
-
-        if photo:
-            await update.message.reply_photo(
-                photo=photo,
-                caption=caption or None
-            )
-        elif caption:
-            await update.message.reply_text(caption)
-        else:
-            await update.message.reply_text(
-                "Load message is unavailable."
-            )
-
-    except Exception:
-        logger.exception("LOAD command failed")
-        await update.message.reply_text(
-            "Something went wrong. Please try again later."
-        )
+async def delete_load():
+    await db_request(
+        "DELETE",
+        "bot_messages",
+        params={"message_key": "eq.load"}
+    )
 
 
 # ================= ADMIN CHECK =================
@@ -159,102 +165,169 @@ def is_admin(update: Update):
     )
 
 
-# ================= ADMIN COMMANDS =================
+# ================= START COMMAND =================
 
-async def setload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-
-    msg = update.message.reply_to_message
-
-    if not msg:
-        await update.message.reply_text(
-            "Reply to a photo or text message with /setload."
-        )
-        return
-
-    photo_id = msg.photo[-1].file_id if msg.photo else None
-    message_text = msg.caption or msg.text or ""
-
-    if not photo_id and not message_text:
-        await update.message.reply_text(
-            "No image or text found."
-        )
-        return
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
 
     try:
-        await db_request(
-            "POST",
-            "bot_messages",
-            params={"on_conflict": "message_key"},
-            headers={
-                **headers(),
-                "Prefer": "resolution=merge-duplicates,return=minimal",
-            },
-            json=[{
-                "message_key": "load",
-                "photo_file_id": photo_id,
-                "message_text": message_text,
-            }]
-        )
-
-        await update.message.reply_text(
-            "✅ LOAD message saved successfully!"
-        )
+        await save_user(user)
 
     except Exception:
-        logger.exception("Saving LOAD message failed")
-        await update.message.reply_text(
-            "Could not save message. Please check database settings."
+        logger.exception("User registration failed")
+
+        await update.effective_message.reply_text(
+            "Something went wrong. Please try again later."
         )
-
-
-async def showload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
         return
 
+    await update.effective_message.reply_text(
+        "Welcome! 👋\n\n"
+        "Send LOAD to receive the latest update."
+    )
+
+
+# ================= LOAD COMMAND =================
+
+async def handle_load(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = update.effective_message
+
     try:
+        await save_user(user)
+
         data = await get_load()
 
         if not data:
-            await update.message.reply_text("No LOAD message saved.")
+            await msg.reply_text(
+                "Load message is currently unavailable. Please try later."
+            )
             return
 
         photo = data.get("photo_file_id")
         caption = data.get("message_text") or ""
 
         if photo:
-            await update.message.reply_photo(
+            await msg.reply_photo(
                 photo=photo,
                 caption=caption or None
             )
+
         elif caption:
-            await update.message.reply_text(caption)
+            await msg.reply_text(caption)
+
         else:
-            await update.message.reply_text("Saved message is empty.")
+            await msg.reply_text(
+                "Load message is unavailable."
+            )
+
+    except Exception:
+        logger.exception("LOAD command failed")
+
+        await msg.reply_text(
+            "Something went wrong. Please try again later."
+        )
+
+
+# ================= SET LOAD =================
+
+async def setload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    msg = update.effective_message
+    replied = msg.reply_to_message
+
+    if not replied:
+        await msg.reply_text(
+            "Reply to a photo or text message with /setload."
+        )
+        return
+
+    photo_id = replied.photo[-1].file_id if replied.photo else None
+    message_text = replied.caption or replied.text or ""
+
+    if not photo_id and not message_text:
+        await msg.reply_text(
+            "No image or text found."
+        )
+        return
+
+    try:
+        await save_load(photo_id, message_text)
+
+        await msg.reply_text(
+            "✅ LOAD message saved successfully!"
+        )
+
+    except Exception:
+        logger.exception("Saving LOAD message failed")
+
+        await msg.reply_text(
+            "Could not save message. Please check database settings."
+        )
+
+
+# ================= SHOW LOAD =================
+
+async def showload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    msg = update.effective_message
+
+    try:
+        data = await get_load()
+
+        if not data:
+            await msg.reply_text("No LOAD message saved.")
+            return
+
+        photo = data.get("photo_file_id")
+        caption = data.get("message_text") or ""
+
+        if photo:
+            await msg.reply_photo(
+                photo=photo,
+                caption=caption or None
+            )
+
+        elif caption:
+            await msg.reply_text(caption)
+
+        else:
+            await msg.reply_text("Saved message is empty.")
 
     except Exception:
         logger.exception("Showing LOAD message failed")
-        await update.message.reply_text("Could not load saved message.")
 
+        await msg.reply_text(
+            "Could not load saved message."
+        )
+
+
+# ================= REMOVE LOAD =================
 
 async def removeload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
 
     try:
-        await db_request(
-            "DELETE",
-            "bot_messages",
-            params={"message_key": "eq.load"}
-        )
+        await delete_load()
 
-        await update.message.reply_text("🗑 LOAD message removed.")
+        await update.effective_message.reply_text(
+            "🗑 LOAD message removed."
+        )
 
     except Exception:
         logger.exception("Removing LOAD message failed")
-        await update.message.reply_text("Could not remove LOAD message.")
 
+        await update.effective_message.reply_text(
+            "Could not remove LOAD message."
+        )
+
+
+# ================= STATS =================
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -264,22 +337,31 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await db_request(
             "GET",
             "bot_users",
-            params={"select": "user_id,is_active"}
+            params={
+                "select": "user_id,is_active",
+                "limit": "10000",
+            }
         )
 
         users = response.json()
-        total = len(users)
-        active = sum(1 for user in users if user.get("is_active"))
 
-        await update.message.reply_text(
-            f"📊 BOT STATISTICS\n\n"
+        total = len(users)
+        active = sum(
+            1 for user in users if user.get("is_active")
+        )
+
+        await update.effective_message.reply_text(
+            "📊 BOT STATISTICS\n\n"
             f"Total Users: {total}\n"
             f"Active Users: {active}"
         )
 
     except Exception:
         logger.exception("Stats command failed")
-        await update.message.reply_text("Could not fetch statistics.")
+
+        await update.effective_message.reply_text(
+            "Could not fetch statistics."
+        )
 
 
 # ================= BROADCAST =================
@@ -288,54 +370,57 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
 
-    msg = update.message.reply_to_message
+    msg = update.effective_message
+    source_message = msg.reply_to_message
 
-    if not msg:
-        await update.message.reply_text(
+    if not source_message:
+        await msg.reply_text(
             "Reply to the message you want to broadcast with /broadcast."
         )
         return
 
     try:
-        response = await db_request(
-            "GET",
-            "bot_users",
-            params={
-                "select": "user_id",
-                "is_active": "eq.true",
-            }
-        )
-
-        users = response.json()
+        users = await get_users()
 
     except Exception:
         logger.exception("Getting broadcast users failed")
-        await update.message.reply_text("Could not fetch users.")
+
+        await msg.reply_text(
+            "Could not fetch users."
+        )
         return
 
-    status = await update.message.reply_text(
-        "📢 Broadcast started..."
+    status = await msg.reply_text(
+        f"📢 Broadcast started...\nTotal users: {len(users)}"
     )
 
     sent = 0
     failed = 0
+    total = len(users)
 
-    for user in users:
-        user_id = user["user_id"]
+    for index, user_id in enumerate(users, start=1):
 
         while True:
             try:
-                await msg.copy(chat_id=user_id)
+                await source_message.copy(chat_id=user_id)
+
                 sent += 1
                 await asyncio.sleep(0.05)
                 break
 
             except RetryAfter as error:
-                wait_time = int(error.retry_after) + 1
+                wait_time = error.retry_after
+
+                if hasattr(wait_time, "total_seconds"):
+                    wait_time = wait_time.total_seconds()
+
+                wait_time = float(wait_time) + 1
+
                 logger.warning(
                     "Broadcast rate limit. Waiting %s seconds.",
                     wait_time
                 )
+
                 await asyncio.sleep(wait_time)
 
             except Forbidden:
@@ -352,163 +437,91 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         },
                         json={"is_active": False}
                     )
+
                 except Exception:
-                    logger.exception("Could not deactivate blocked user")
+                    logger.exception(
+                        "Could not deactivate blocked user %s",
+                        user_id
+                    )
 
                 break
 
             except Exception:
                 failed += 1
-                logger.exception("Broadcast failed for user %s", user_id)
+
+                logger.exception(
+                    "Broadcast failed for user %s",
+                    user_id
+                )
                 break
 
-    await status.edit_text(
-        f"✅ BROADCAST COMPLETED\n\n"
-        f"Sent: {sent}\n"
-        f"Failed: {failed}"
-    )
+        if index % 100 == 0:
+            try:
+                await status.edit_text(
+                    "📢 BROADCAST IN PROGRESS\n\n"
+                    f"Progress: {index}/{total}\n"
+                    f"Sent: {sent}\n"
+                    f"Failed: {failed}"
+                )
+            except Exception:
+                pass
+
+            await asyncio.sleep(1)
+
+    try:
+        await status.edit_text(
+            "✅ BROADCAST COMPLETED\n\n"
+            f"Total Users: {total}\n"
+            f"Sent: {sent}\n"
+            f"Failed: {failed}"
+        )
+
+    except Exception:
+        logger.exception("Could not update broadcast report")
 
 
 # ================= HELP =================
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update):
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "ADMIN COMMANDS\n\n"
             "/setload - Save LOAD message (reply to photo/text)\n"
             "/showload - View saved message\n"
-            "/removeload - Remove LOAD message\n"
+            "/removeload - Remove saved message\n"
             "/broadcast - Broadcast (reply to a message)\n"
             "/stats - User statistics\n"
             "/help - Show commands"
         )
+
     else:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "Send LOAD to receive the latest update."
         )
 
 
 # ================= ERROR HANDLER =================
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(
-        "Telegram update error",
-        exc_info=context.error
-    )
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    error = context.error
 
-
-# ================= WEB SERVER =================
-
-class HealthHandler(tornado.web.RequestHandler):
-    def get(self):
-        self.write("OK")
-
-    def head(self):
-        self.set_status(200)
-
-
-class WebhookHandler(tornado.web.RequestHandler):
-    def initialize(self, tg_app):
-        self.tg_app = tg_app
-
-    async def post(self):
-        token = self.request.headers.get(
-            "X-Telegram-Bot-Api-Secret-Token"
+    if error:
+        logger.error(
+            "Telegram update error",
+            exc_info=(
+                type(error),
+                error,
+                error.__traceback__,
+            )
         )
-
-        if token != WEBHOOK_SECRET:
-            self.set_status(403)
-            return
-
-        try:
-            data = json.loads(self.request.body)
-            update = Update.de_json(data, self.tg_app.bot)
-            await self.tg_app.update_queue.put(update)
-
-        except Exception:
-            logger.exception("Bad webhook payload")
-            self.set_status(400)
-            return
-
-        self.set_status(200)
-
-
-# ================= BOT STARTUP =================
-
-async def start_bot(tg_app: Application):
-    """Connects to Telegram in the background with safe retry/backoff."""
-
-    webhook_url = (
-        f"{RENDER_EXTERNAL_URL.rstrip('/')}/{WEBHOOK_SECRET}"
-    )
-
-    attempt = 0
-
-    while True:
-        attempt += 1
-        initialized = False
-        started = False
-        wait_time = 10
-
-        try:
-            await tg_app.initialize()
-            initialized = True
-
-            await tg_app.start()
-            started = True
-
-            await tg_app.bot.set_webhook(
-                url=webhook_url,
-                secret_token=WEBHOOK_SECRET,
-                allowed_updates=Update.ALL_TYPES,
-            )
-
-            logger.info("Webhook set. Bot is live.")
-            return
-
-        except RetryAfter as error:
-            wait_time = int(error.retry_after) + 2
-
-            logger.warning(
-                "Telegram rate limit during startup. Waiting %s seconds.",
-                wait_time,
-            )
-
-        except Exception:
-            wait_time = min(
-                10 * (2 ** min(attempt - 1, 4)),
-                160
-            )
-
-            logger.exception(
-                "Bot startup attempt %s failed. Retrying in %s seconds.",
-                attempt,
-                wait_time,
-            )
-
-        finally:
-            if started:
-                try:
-                    await tg_app.stop()
-                except Exception:
-                    logger.exception(
-                        "Could not stop bot after failed startup"
-                    )
-
-            if initialized:
-                try:
-                    await tg_app.shutdown()
-                except Exception:
-                    logger.exception(
-                        "Could not shut down bot after failed startup"
-                    )
-
-        await asyncio.sleep(wait_time)
 
 
 # ================= MAIN =================
 
-async def run():
+def main():
     required = [
         BOT_TOKEN,
         SUPABASE_URL,
@@ -519,69 +532,63 @@ async def run():
 
     if not all(required) or ADMIN_ID == 0:
         raise RuntimeError(
-            "Missing required environment variables. Check Render Environment."
+            "Missing required environment variables. "
+            "Check Render Environment."
         )
 
-    telegram_request = HTTPXRequest(
-        connect_timeout=30,
-        read_timeout=30,
-        write_timeout=30,
-        pool_timeout=30,
-    )
+    if len(WEBHOOK_SECRET) < 1 or len(WEBHOOK_SECRET) > 256:
+        raise RuntimeError(
+            "WEBHOOK_SECRET must be between 1 and 256 characters."
+        )
 
-    tg_app = (
+    app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .request(telegram_request)
-        .updater(None)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
         .build()
     )
 
     # Register commands
 
-    tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(CommandHandler("help", help_command))
-    tg_app.add_handler(CommandHandler("setload", setload))
-    tg_app.add_handler(CommandHandler("showload", showload))
-    tg_app.add_handler(CommandHandler("removeload", removeload))
-    tg_app.add_handler(CommandHandler("stats", stats))
-    tg_app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
 
-    tg_app.add_handler(
+    app.add_handler(CommandHandler("setload", setload))
+    app.add_handler(CommandHandler("showload", showload))
+    app.add_handler(CommandHandler("removeload", removeload))
+
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+
+    # LOAD message handler
+
+    app.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(r"(?i)^LOAD$"),
             handle_load
         )
     )
 
-    tg_app.add_error_handler(error_handler)
+    app.add_error_handler(error_handler)
 
-    web = tornado.web.Application([
-        (r"/", HealthHandler),
-        (r"/healthz", HealthHandler),
-        (
-            rf"/{WEBHOOK_SECRET}",
-            WebhookHandler,
-            {"tg_app": tg_app}
+    logger.info("Starting LOAD Message Bot...")
+
+    # Same webhook method as the working Kaptaan bot
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_SECRET,
+        webhook_url=(
+            f"{RENDER_EXTERNAL_URL.rstrip('/')}/{WEBHOOK_SECRET}"
         ),
-    ])
-
-    # Open port FIRST
-
-    web.listen(PORT, address="0.0.0.0")
-
-    logger.info(
-        "HTTP server listening on 0.0.0.0:%s",
-        PORT
+        secret_token=WEBHOOK_SECRET,
+        allowed_updates=Update.ALL_TYPES,
     )
-
-    # Connect to Telegram in background
-
-    asyncio.create_task(start_bot(tg_app))
-
-    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    logger.info("Starting LOAD Message Bot...")
-    asyncio.run(run())
+    main()
