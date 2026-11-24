@@ -30,6 +30,11 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
+# Hide HTTP request URLs containing the bot token
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 
@@ -326,7 +331,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
 
             except RetryAfter as error:
-                wait_time = error.retry_after + 1
+                wait_time = int(error.retry_after) + 1
                 logger.warning(
                     "Broadcast rate limit. Waiting %s seconds.",
                     wait_time
@@ -392,7 +397,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ================= WEB SERVER (opens the port immediately) =================
+# ================= WEB SERVER =================
 
 class HealthHandler(tornado.web.RequestHandler):
     def get(self):
@@ -407,7 +412,10 @@ class WebhookHandler(tornado.web.RequestHandler):
         self.tg_app = tg_app
 
     async def post(self):
-        token = self.request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        token = self.request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token"
+        )
+
         if token != WEBHOOK_SECRET:
             self.set_status(403)
             return
@@ -416,6 +424,7 @@ class WebhookHandler(tornado.web.RequestHandler):
             data = json.loads(self.request.body)
             update = Update.de_json(data, self.tg_app.bot)
             await self.tg_app.update_queue.put(update)
+
         except Exception:
             logger.exception("Bad webhook payload")
             self.set_status(400)
@@ -427,30 +436,74 @@ class WebhookHandler(tornado.web.RequestHandler):
 # ================= BOT STARTUP =================
 
 async def start_bot(tg_app: Application):
-    """Runs in background so the port is already open while this retries."""
-    webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{WEBHOOK_SECRET}"
+    """Connects to Telegram in the background with safe retry/backoff."""
+
+    webhook_url = (
+        f"{RENDER_EXTERNAL_URL.rstrip('/')}/{WEBHOOK_SECRET}"
+    )
+
     attempt = 0
 
     while True:
         attempt += 1
+        initialized = False
+        started = False
+        wait_time = 10
+
         try:
             await tg_app.initialize()
+            initialized = True
+
             await tg_app.start()
+            started = True
+
             await tg_app.bot.set_webhook(
                 url=webhook_url,
                 secret_token=WEBHOOK_SECRET,
                 allowed_updates=Update.ALL_TYPES,
             )
+
             logger.info("Webhook set. Bot is live.")
             return
+
+        except RetryAfter as error:
+            wait_time = int(error.retry_after) + 2
+
+            logger.warning(
+                "Telegram rate limit during startup. Waiting %s seconds.",
+                wait_time,
+            )
+
         except Exception:
-            logger.exception("Bot startup attempt %s failed, retrying in 10s", attempt)
-            try:
-                await tg_app.stop()
-                await tg_app.shutdown()
-            except Exception:
-                pass
-            await asyncio.sleep(10)
+            wait_time = min(
+                10 * (2 ** min(attempt - 1, 4)),
+                160
+            )
+
+            logger.exception(
+                "Bot startup attempt %s failed. Retrying in %s seconds.",
+                attempt,
+                wait_time,
+            )
+
+        finally:
+            if started:
+                try:
+                    await tg_app.stop()
+                except Exception:
+                    logger.exception(
+                        "Could not stop bot after failed startup"
+                    )
+
+            if initialized:
+                try:
+                    await tg_app.shutdown()
+                except Exception:
+                    logger.exception(
+                        "Could not shut down bot after failed startup"
+                    )
+
+        await asyncio.sleep(wait_time)
 
 
 # ================= MAIN =================
@@ -480,9 +533,11 @@ async def run():
         Application.builder()
         .token(BOT_TOKEN)
         .request(telegram_request)
-        .updater(None)  # we receive updates through our own webhook handler
+        .updater(None)
         .build()
     )
+
+    # Register commands
 
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("help", help_command))
@@ -504,14 +559,24 @@ async def run():
     web = tornado.web.Application([
         (r"/", HealthHandler),
         (r"/healthz", HealthHandler),
-        (rf"/{WEBHOOK_SECRET}", WebhookHandler, {"tg_app": tg_app}),
+        (
+            rf"/{WEBHOOK_SECRET}",
+            WebhookHandler,
+            {"tg_app": tg_app}
+        ),
     ])
 
-    # 1) Open the port FIRST so Render detects it
-    web.listen(PORT, address="0.0.0.0")
-    logger.info("HTTP server listening on 0.0.0.0:%s", PORT)
+    # Open port FIRST
 
-    # 2) Then connect to Telegram in the background
+    web.listen(PORT, address="0.0.0.0")
+
+    logger.info(
+        "HTTP server listening on 0.0.0.0:%s",
+        PORT
+    )
+
+    # Connect to Telegram in background
+
     asyncio.create_task(start_bot(tg_app))
 
     await asyncio.Event().wait()
